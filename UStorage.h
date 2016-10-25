@@ -138,6 +138,34 @@ struct scsi_head{
 	int16_t wlun;
 	int16_t relag; /*Response Code*/
 };
+
+#define SCSI_HEAD_SIZE			sizeof(struct scsi_head)
+#define STOR_PAYLOAD		1
+#define SCSI_PHONE_MAGIC		 0xccddeeff
+#define SCSI_DEVICE_MAGIC		 0xaabbccdd
+#define SCSI_WFLAG  1 << 7
+#define NXP_USBBUF			(8*1024)
+#define NXP_DFT_SECTOR_SIZE		512
+
+enum {
+  SCSI_TEST = 0,
+  SCSI_READ  = 1,//28
+  SCSI_WRITE = 2 | SCSI_WFLAG,//2a
+  SCSI_INQUIRY = 3,//12
+  SCSI_READ_CAPACITY =4,//25
+  SCSI_GET_LUN = 5,
+  SCSI_INPUT = 6,
+  SCSI_OUTPUT = 7,
+};
+
+enum{
+	EREAD = 1,
+	EWRITE=2,
+	ENODISK = 3,
+	EDISKLEN = 4,
+	EDISKINFO=5
+};
+
 #ifdef __cplusplus
 }
 #endif

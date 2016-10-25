@@ -34,6 +34,7 @@
 #include "fsusb_cfg.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "UStorage.h"
 /*****************************************************************************
  * Private types/enumerations/variables
  ****************************************************************************/
@@ -89,6 +90,8 @@ static USB_ClassInfo_UStorage_t UStorage_Interface[]	= {
 	},
 	
 };
+static SCSI_Capacity_t DiskCapacity;
+uint8_t  sBuffer[NXP_USBBUF];
 
 /*****************************************************************************
  * Public types/enumerations/variables
@@ -135,13 +138,277 @@ static void SetupHardware(void)
 	Board_Debug_Init();
 #endif
 }
+
+static int storage_diskLUN(const uint8_t corenum, struct scsi_head *scsi)
+{
+	uint8_t buffer[512] = {0};
+	uint8_t disklun = 0;
+	uint8_t ErrorCode = PIPE_RWSTREAM_NoError;
+
+	if(UStorage_Interface[USTOR_DISK_USBADDR].State.IsActive == true){
+		disklun = 1;
+	}else{
+		disklun = 0;
+	}	
+	DEBUGOUT("Disk LUN is %d\r\n", disklun);
+	memcpy(buffer, scsi, SCSI_HEAD_SIZE);
+	memcpy(buffer+SCSI_HEAD_SIZE, &disklun, STOR_PAYLOAD);
+	/*Write to Phone*/
+	Pipe_SelectPipe(corenum,
+		UStorage_Interface[corenum].Config.DataOUTPipeNumber);
+	Pipe_Unfreeze();
+
+	if ((ErrorCode = Pipe_Write_Stream_LE(corenum,buffer, SCSI_HEAD_SIZE+STOR_PAYLOAD,
+	                                      NULL)) != PIPE_RWSTREAM_NoError)
+	{
+		return ErrorCode;
+	}
+	
+	Pipe_ClearOUT(corenum);
+	Pipe_WaitUntilReady(corenum);
+
+	Pipe_Freeze();
+	DEBUGOUT("Handle DISKLUN Finish \r\n");
+	return 0;
+}
+
+static int usb_send(const uint8_t corenum, uint8_t *buffer, uint16_t Length)
+{
+	uint8_t ErrorCode = PIPE_RWSTREAM_NoError;
+	
+	/*Write to Phone*/
+	Pipe_SelectPipe(corenum,
+		UStorage_Interface[corenum].Config.DataOUTPipeNumber);
+	Pipe_Unfreeze();
+
+	if ((ErrorCode = Pipe_Write_Stream_LE(corenum,buffer, Length,
+	                                      NULL)) != PIPE_RWSTREAM_NoError)
+	{
+		return ErrorCode;
+	}
+//	DEBUGOUT("USB PIPE Buffer Size [%d]\r\n", PipeInfo[corenum][pipeselected[corenum]].ByteTransfered);
+	Pipe_ClearOUT(corenum);
+	Pipe_WaitUntilReady(corenum);
+
+	Pipe_Freeze();
+
+	return PIPE_RWSTREAM_NoError;
+}
+void disk_printSector(uint8_t *buffer, int length)
+{
+	int cur = 0;
+	
+	if(!buffer){
+		return;
+	}
+
+	for(; cur< length; cur++){
+		if(cur % 16 == 0){
+			DEBUGOUT("\r\n");
+		}
+		DEBUGOUT("0x%2x ", buffer[cur]);
+
+	}
+	
+	DEBUGOUT("\r\n");
+}
+static int storage_diskREAD(const uint8_t corenum, struct scsi_head *scsi)
+{
+	int readBlock = 0, readCount = 0, readCur=0, readLast = 0;
+	int sndLoop = 0, sndCur = 0, sndSize, sndLast = 0;
+	int32_t addr = scsi->addr;	
+	uint8_t ErrorCode;
+	uint16_t Length;
+
+	if(UStorage_Interface[USTOR_DISK_USBADDR].State.IsActive != true){
+		scsi->relag = EREAD;
+		scsi->head = SCSI_DEVICE_MAGIC;
+		DEBUGOUT("Disk Not Insert...\r\n");
+		return usb_send(corenum, (uint8_t *)scsi, SCSI_HEAD_SIZE);
+	}
+	/*Send Header*/
+	if(usb_send(corenum, (uint8_t *)scsi, SCSI_HEAD_SIZE) != PIPE_RWSTREAM_NoError){
+		DEBUGOUT("Send To Phone Error...\r\n");
+		return -1;
+	}
+	/*Read Data*/
+	readCount = scsi->len /NXP_USBBUF;
+	readLast = scsi->len%NXP_USBBUF;
+	if(readLast){
+		readCount++;
+		readLast = readLast/DiskCapacity.BlockSize;
+	}
+	readBlock = NXP_USBBUF/ (DiskCapacity.BlockSize);
+	sndSize = DiskCapacity.BlockSize -1;
+	DEBUGOUT("read SECstart = %u, numsec=%u, disk=%d BlockSize=%d\r\n", 
+		scsi->addr, scsi->len/DiskCapacity.BlockSize, UStorage_Interface[USTOR_DISK_USBADDR].Config.PortNumber, DiskCapacity.BlockSize);	
+	while(UStorage_Interface[USTOR_DISK_USBADDR].State.IsActive == true &&
+			readCur < readCount){
+		memset(sBuffer, 0, sizeof(sBuffer));
+		sndCur = 0;
+		sndLast = 0;
+		if(readCur+1 == readCount && readLast){
+			/*last read*/
+			ErrorCode = MS_Host_ReadDeviceBlocks(&UStorage_Interface[USTOR_DISK_USBADDR], 0, addr,
+										readLast, DiskCapacity.BlockSize, sBuffer);
+			addr += readLast;
+			Length = scsi->len%NXP_USBBUF;
+		}else{
+			ErrorCode = MS_Host_ReadDeviceBlocks(&UStorage_Interface[USTOR_DISK_USBADDR], 0, addr,
+										readBlock, DiskCapacity.BlockSize, sBuffer);
+			addr += readCount;
+			Length = NXP_USBBUF;
+		}
+		if(ErrorCode){
+			DEBUGOUT("Error reading device block. ret = %d\r\n", ErrorCode);
+			USB_Host_SetDeviceConfiguration(UStorage_Interface[USTOR_DISK_USBADDR].Config.PortNumber, 0);
+			return -1;
+		}
+		/*add cur*/
+		readCur++;
+		/*Send to Phone*/
+		/*Write Content*/		
+		//disk_printSector(strpay, NXP_USBBUF);
+		sndLoop = Length/sndSize;
+		sndLast = Length%sndSize;
+		if(sndLast){
+			sndLoop++;	
+		}
+
+		while(sndCur < sndLoop){
+			if(sndLast && sndCur+1 == sndLoop){
+				ErrorCode = usb_send(corenum, sBuffer+(sndCur*sndSize), sndLast);
+			}else{
+				ErrorCode = usb_send(corenum, sBuffer+(sndCur*sndSize), sndSize);
+			}
+			if(ErrorCode){
+				DEBUGOUT("USB Send Error [PAYLOAD]\r\n");
+				return -1;
+			}
+			sndCur++;
+		}
+	}
+
+	DEBUGOUT("Send To Phone Successful [%dBytes]\r\n", 
+				scsi->len+SCSI_HEAD_SIZE);
+	return 0;
+}
+
+#if 0
+static int storage_diskWRITE(const uint8_t corenum, struct scsi_head *scsi)
+{
+	int32_t curWrite = 0, lenWrtie = 0;
+	USB_ClassInfo_MS_Host_t *MSInterfaceInfo = &UStorage_Interface[USTOR_PHONE_USBADDR];
+
+	if(!scsi || scsi->len == 0){
+		return -1;
+	}
+	memset(sBuffer, 0, sizeof(sBuffer));
+	while(curWrite < scsi->len){
+		Pipe_SelectPipe(USTOR_PHONE_USBADDR,MSInterfaceInfo->Config.DataINPipeNumber);
+		if(scsi->len-curWrite >= MSInterfaceInfo->State.DataINPipeSize){
+			lenWrtie = MSInterfaceInfo->State.DataINPipeSize-1;
+		}else{
+			lenWrtie = scsi->len-curWrite;
+		}
+		Pipe_Streaming(USTOR_PHONE_USBADDR, sBuffer+curWrite,
+				lenWrtie, MSInterfaceInfo->State.DataINPipeSize);
+		
+		while(MSInterfaceInfo->State.IsActive == true 
+				&& !Pipe_IsStatusOK(USTOR_PHONE_USBADDR));
+		if(MSInterfaceInfo->State.IsActive != true){
+			DEBUGOUT("Continue Port %d Disconncet...\r\n", USTOR_PHONE_USBADDR);
+			return -1;
+		}else{
+			DEBUGOUT("Continue Pipe_Read_Stream_LE Successful[%dBytes]\r\n", 
+					PipeInfo[corenum][pipeselected[corenum]].ByteTransfered);
+		}	
+		Pipe_ClearIN(USTOR_PHONE_USBADDR);
+		curWrite += lenWrtie;
+	}
+	disk_printSector(sBuffer, scsi->len);
+	if(usb_send(corenum, (uint8_t *)scsi, SCSI_HEAD_SIZE) ==PIPE_RWSTREAM_NoError){
+		DEBUGOUT("Write Finish Send To Phone\r\nwtag=%d\r\nctrid=%d\r\naddr=%d\r\nlen=%d\r\nwlun=%d\r\n", 
+					scsi->wtag, scsi->ctrid, scsi->addr, scsi->len, scsi->wlun);
+	}
+	return 0;
+}
+#else
+static int storage_diskWRITE(const uint8_t corenum, struct scsi_head *scsi)
+{
+	int32_t curWrite = 0, lenWrtie = 0;
+	USB_ClassInfo_MS_Host_t *MSInterfaceInfo = &UStorage_Interface[USTOR_PHONE_USBADDR];
+
+	if(!scsi || scsi->len == 0){
+		return -1;
+	}
+	memset(sBuffer, 0, sizeof(sBuffer));
+	while(curWrite < scsi->len){
+		Pipe_SelectPipe(USTOR_PHONE_USBADDR,MSInterfaceInfo->Config.DataINPipeNumber);
+		if(scsi->len-curWrite >= MSInterfaceInfo->State.DataINPipeSize){
+			lenWrtie = MSInterfaceInfo->State.DataINPipeSize-1;
+		}else{
+			lenWrtie = scsi->len-curWrite;
+		}
+		Pipe_Streaming(USTOR_PHONE_USBADDR, sBuffer+curWrite,
+				lenWrtie, MSInterfaceInfo->State.DataINPipeSize);
+		
+		while(MSInterfaceInfo->State.IsActive == true 
+				&& !Pipe_IsStatusOK(USTOR_PHONE_USBADDR));
+		if(MSInterfaceInfo->State.IsActive != true){
+			DEBUGOUT("Continue Port %d Disconncet...\r\n", USTOR_PHONE_USBADDR);
+			return -1;
+		}else{
+			DEBUGOUT("Continue Pipe_Read_Stream_LE Successful[%dBytes]\r\n", 
+					PipeInfo[corenum][pipeselected[corenum]].ByteTransfered);
+		}	
+		Pipe_ClearIN(USTOR_PHONE_USBADDR);
+		curWrite += lenWrtie;
+	}
+	disk_printSector(sBuffer, scsi->len);
+	if(usb_send(corenum, (uint8_t *)scsi, SCSI_HEAD_SIZE) ==PIPE_RWSTREAM_NoError){
+		DEBUGOUT("Write Finish Send To Phone\r\nwtag=%d\r\nctrid=%d\r\naddr=%d\r\nlen=%d\r\nwlun=%d\r\n", 
+					scsi->wtag, scsi->ctrid, scsi->addr, scsi->len, scsi->wlun);
+	}
+	vTaskDelay(50);
+	return 0;
+}
+
+
+#endif
+
+static int UStorage_Application_Handle(const uint8_t corenum, 
+										struct scsi_head *header)
+{	
+	if(!header ||corenum >= 2){
+		DEBUGOUT("Parameter Error\r\n");
+		return -1;
+	}
+
+	switch(header->ctrid){
+		case SCSI_READ:
+			storage_diskREAD(corenum, header);
+			break;
+		case SCSI_WRITE:		
+			storage_diskWRITE(corenum, header);
+			break;
+		case SCSI_GET_LUN:
+			storage_diskLUN(corenum, header);
+			break;
+		default:
+			DEBUGOUT("Unhandle Command\r\n");
+	}
+
+	return 0;
+}
+
+
 /*USB for Phone*/
 static void vUStoragePhoneTask(void *pvParameters)
 {
-	uint8_t  ErrorCode = PIPE_RWSTREAM_NoError;
-	uint16_t BytesRem =24;
 	struct scsi_head header;
-
+	uint8_t  ErrorCode = PIPE_RWSTREAM_NoError;
+	
 	while(1){
 		USB_ClassInfo_MS_Host_t *MSInterfaceInfo = NULL;
 		if (USB_HostState[USTOR_PHONE_USBADDR] != HOST_STATE_Configured) {
@@ -151,13 +418,13 @@ static void vUStoragePhoneTask(void *pvParameters)
 		/*Have Connected Phone Read or Write*/
 		/*Test*/
 		MSInterfaceInfo = &UStorage_Interface[USTOR_PHONE_USBADDR];
+#if defined(__LPC177X_8X__) || defined(__LPC407X_8X__)
 		if ((ErrorCode = MS_Host_WaitForDataReceived(MSInterfaceInfo)) != PIPE_RWSTREAM_NoError)
 		{
 			Pipe_Freeze();
 			DEBUGOUT("Wait Data Timeout\r\n");
 			continue;
 		}
-
 		Pipe_SelectPipe(USTOR_PHONE_USBADDR,MSInterfaceInfo->Config.DataINPipeNumber);
 		Pipe_Unfreeze();
 		memset(&header, 0, sizeof(struct scsi_head));
@@ -166,14 +433,79 @@ static void vUStoragePhoneTask(void *pvParameters)
 			Pipe_ClearIN(USTOR_PHONE_USBADDR);
 			continue;
 		}
-		DEBUGOUT("Pipe_Read_Stream_LE Successful\r\nwtag=%d\r\nctrid=%d\r\naddr=%d\r\nlen=%d\r\nwlun=%d\r\n", 
-					header.wtag, header.ctrid, header.addr, header.len, header.wlun);
+#else
+		Pipe_SelectPipe(USTOR_PHONE_USBADDR,MSInterfaceInfo->Config.DataINPipeNumber);
+		memset(&header, 0, SCSI_HEAD_SIZE);
+		ErrorCode = Pipe_Streaming(USTOR_PHONE_USBADDR,(uint8_t*)(&header),
+				SCSI_HEAD_SIZE, MSInterfaceInfo->State.DataINPipeSize);
+		if(ErrorCode == PIPE_RWSTREAM_IncompleteTransfer){
+			DEBUGOUT("PiPe Streaming Not Ready[%d]...\r\n", PIPE_RWSTREAM_IncompleteTransfer);			
+		}else{
+			DEBUGOUT("PiPe Streaming Read[%dBytes]...\r\n", 
+					PipeInfo[USTOR_PHONE_USBADDR][pipeselected[USTOR_PHONE_USBADDR]].ByteTransfered);
+		}
+		while(MSInterfaceInfo->State.IsActive == true 
+				&& !Pipe_IsStatusOK(USTOR_PHONE_USBADDR));
+		
+#endif
 		Pipe_ClearIN(USTOR_PHONE_USBADDR);
+		if(MSInterfaceInfo->State.IsActive != true){
+			DEBUGOUT("Port %d Disconncet...\r\n", USTOR_PHONE_USBADDR);			
+		}else{
+			if(header.wtag == 0){
+				DEBUGOUT("May Be Read ZLP[IGNORE]...\r\n");
+				continue;
+			}			
+			DEBUGOUT("Pipe_Read_Stream_LE Successful\r\nwtag=%d\r\nctrid=%d\r\naddr=%d\r\nlen=%d\r\nwlun=%d\r\n", 
+					header.wtag, header.ctrid, header.addr, header.len, header.wlun);
+			UStorage_Application_Handle(USTOR_PHONE_USBADDR, &header);
+		}
 	}
 }
 /*USB for Storage*/
-static void vUStorageDiskTask(void *pvParameters) {
 
+int usb_diskINFO(void)
+{
+	USB_ClassInfo_MS_Host_t *MSInterfaceInfo = NULL;
+
+	DEBUGOUT("Waiting for ready...");
+	MSInterfaceInfo = &UStorage_Interface[USTOR_DISK_USBADDR];
+	for (;; ) {
+		uint8_t ErrorCode = MS_Host_TestUnitReady(MSInterfaceInfo, 0);
+	
+		if (!(ErrorCode)) {
+			break;
+		}
+	
+		/* Check if an error other than a logical command error (device busy) received */
+		if (ErrorCode != MS_ERROR_LOGICAL_CMD_FAILED) {
+			DEBUGOUT("Failed\r\n");
+			USB_Host_SetDeviceConfiguration(MSInterfaceInfo->Config.PortNumber, 0);
+			return ErrorCode;
+		}
+	}
+	DEBUGOUT("Done.\r\n");
+	
+	if (MS_Host_ReadDeviceCapacity(MSInterfaceInfo, 0, &DiskCapacity)) {
+		DEBUGOUT("Error retrieving device capacity.\r\n");
+		USB_Host_SetDeviceConfiguration(MSInterfaceInfo->Config.PortNumber, 0);
+		return 1;
+	}
+
+	return 0;
+}
+void vUStorageDiskTask(void *pvParameters)
+{
+	
+	while(1){
+		if (USB_HostState[USTOR_DISK_USBADDR] != HOST_STATE_Configured) {
+	//		DEBUGOUT("Disk Stat is %d...\r\n", USB_HostState[USTOR_DISK_USBADDR]);
+			USB_USBTask(USTOR_DISK_USBADDR, USB_MODE_Host);
+			continue;
+		}
+		break;
+	}
+	usb_diskINFO();
 }
 
 /*****************************************************************************
@@ -186,12 +518,10 @@ static void vUStorageDiskTask(void *pvParameters) {
  */
 void vs_main(void *pvParameters)
 {
-	int ret;
-	char ubuffer[USTORAGE_BUFFER_SIZE];
-
 	SetupHardware();
 
 	DEBUGOUT("U-Storage Running.\r\n");
+	vUStorageDiskTask(NULL);
 	vUStoragePhoneTask(NULL);
 }
 
@@ -322,6 +652,29 @@ uint8_t MS_Host_Ustorage_SwitchAOA(const uint8_t corenum,
 	return 0;
 }
 
+static uint8_t DCOMP_MS_Host_NextMSInterfaceEndpoint(void* const CurrentDescriptor)
+{
+	USB_Descriptor_Header_t* Header = DESCRIPTOR_PCAST(CurrentDescriptor, USB_Descriptor_Header_t);
+
+	if (Header->Type == DTYPE_Endpoint)
+	{
+		USB_Descriptor_Endpoint_t* Endpoint = DESCRIPTOR_PCAST(CurrentDescriptor, USB_Descriptor_Endpoint_t);
+
+		uint8_t EndpointType = (Endpoint->Attributes & EP_TYPE_MASK);
+
+		if ((EndpointType == EP_TYPE_BULK) && (!(Pipe_IsEndpointBound(Endpoint->EndpointAddress))))
+		{
+			return DESCRIPTOR_SEARCH_Found;
+		}
+	}
+	else if (Header->Type == DTYPE_Interface)
+	{
+		return DESCRIPTOR_SEARCH_Fail;
+	}
+
+	return DESCRIPTOR_SEARCH_NotFound;
+}
+
 
 /*Add by Szitman 20161022*/
 uint8_t MS_Host_Ustorage_ConfigurePipes(USB_ClassInfo_MS_Host_t* const MSInterfaceInfo,
@@ -418,7 +771,12 @@ uint8_t MS_Host_Ustorage_ConfigurePipes(USB_ClassInfo_MS_Host_t* const MSInterfa
  */
 void EVENT_USB_Host_DeviceAttached(const uint8_t corenum)
 {
-	DEBUGOUT(("Device Attached on port %d\r\n"), corenum);
+	if(corenum == USTOR_DISK_USBADDR){
+		DEBUGOUT(("Disk Attached on port %d\r\n"), corenum);	
+	}else{
+		DEBUGOUT(("Phone Attached on port %d\r\n"), corenum);
+		
+	}
 }
 
 /** Event handler for the USB_DeviceUnattached event. This indicates that a device has been removed from the host, and
@@ -427,6 +785,7 @@ void EVENT_USB_Host_DeviceAttached(const uint8_t corenum)
 void EVENT_USB_Host_DeviceUnattached(const uint8_t corenum)
 {
 	DEBUGOUT(("\r\nDevice Unattached on port %d\r\n"), corenum);
+	memset(&(UStorage_Interface[corenum].State), 0x00, sizeof(UStorage_Interface[corenum].State));
 }
 
 /** Event handler for the USB_DeviceEnumerationComplete event. This indicates that a device has been successfully
@@ -536,7 +895,7 @@ void EVENT_USB_Host_Phone_DeviceEnumerationComplete(const uint8_t corenum)
 			return;
 		}
 		/*Android AOA Device Found*/
-		DEBUGOUT("Mass Storage Device Enumerated.\r\n");
+		DEBUGOUT("Android AOA Device Enumerated.\r\n");
 		return;
 	}
 	/*Try Switch AOA*/
